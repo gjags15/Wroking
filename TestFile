@@ -1,0 +1,2 @@
+.withColumn("phr_offset_ms", col("ph_start_ms").cast("long") - col("t_start_time").cast("long"))
+.withColumn("phr_start_mmss", ms_to_mmss_udf(col("ph_offset_ms")))
