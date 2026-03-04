@@ -1,2 +1,93 @@
-.withColumn("phr_offset_ms", col("ph_start_ms").cast("long") - col("t_start_time").cast("long"))
-.withColumn("phr_start_mmss", ms_to_mmss_udf(col("ph_offset_ms")))
+import concurrent.futures
+import threading
+from collections import defaultdict
+
+all_records = []
+failed_conversations = []
+success_count = 0
+skip_count = 0
+total_processed = 0
+lock = threading.Lock()  # Thread-safe counter updates
+
+speech_api_tls = threading.local()  # Thread-local API instance
+
+def get_speech_api():
+    """Get or create thread-local API instance"""
+    if not hasattr(speech_api_tls, 'api'):
+        speech_api_tls.api = PureCloudPlatformClientV2.SpeechTextAnalyticsApi()
+    return speech_api_tls.api
+
+def process_row(row):
+    global success_count, skip_count, total_processed
+    
+    conversation_id = row.conversation_id
+    communication_id = row.communication_id
+    
+    try:
+        speech_api = get_speech_api()
+        
+        api_response = speech_api.get_speechandtextanalytics_conversation_communication_transcripturl(
+            conversation_id,
+            communication_id
+        )
+
+        if not api_response or not api_response.url:
+            with lock:
+                skip_count += 1
+                total_processed += 1
+            return None
+
+        transcript_url = api_response.url
+        response = requests.get(transcript_url, timeout=30)
+        response.raise_for_status()
+        transcript_json = response.json()
+
+        with lock:
+            success_count += 1
+            total_processed += 1
+            if total_processed % 100 == 0:
+                print(f"Progress: {total_processed} processed | {success_count} success | {skip_count} skipped")
+
+        return {
+            "conversation_id": conversation_id,
+            "communication_id": communication_id,
+            "transcript_url": transcript_url,
+            "transcript_data": transcript_json
+        }
+
+    except ApiException as e:
+        with lock:
+            skip_count += 1
+            total_processed += 1
+        if e.status == 429:
+            print(f"Rate limit hit for {conversation_id}, sleeping...")
+            time.sleep(5)
+        elif e.status != 404:
+            print(f"API error for {conversation_id}: {e}")
+        return None
+
+    except Exception as e:
+        with lock:
+            skip_count += 1
+            total_processed += 1
+        print(f"Unexpected error for {conversation_id}: {e}")
+        return None
+
+
+# Run with thread pool
+rows = distinct_df.limit(100).collect()  # Change limit as needed
+
+with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+    futures = [executor.submit(process_row, row) for row in rows]
+    
+    for future in concurrent.futures.as_completed(futures):
+        result = future.result()
+        if result:
+            all_records.append(result)
+
+# Final summary
+print(f"\n=== FINAL SUMMARY ===")
+print(f"Total processed: {total_processed}")
+print(f"Success: {success_count}")
+print(f"Skipped: {skip_count}")
+print(f"Total records collected: {len(all_records)}")
